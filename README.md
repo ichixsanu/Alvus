@@ -208,11 +208,11 @@ aider --openai-api-base http://localhost:3000/v1 --openai-api-key sk-dummy
 2. Body is buffered (needed for retry replay)
 3. Round-robin picks the next available key
 4. Request forwarded upstream with that key injected
-        │
-        ├── ✅ 2xx/3xx → headers + body streamed back, done
-        ├── ❄️ 429     → key enters cooldown, retry with next key
-        ├── 🔑 401/403 → key permanently removed from pool
-        └── ⚠️ other 4xx/5xx → passed through as-is
+   │
+   ├── ✅ 2xx/3xx → request count incremented, headers + body streamed back, done
+   ├── ❄️ 429 → key enters cooldown, retry with next key
+   ├── 🔑 401/403 → key permanently removed from pool
+   └── ⚠️ other 4xx/5xx → passed through as-is
 ```
 
 Your agent sees a clean stream or a final error. Never a 429.
@@ -229,7 +229,24 @@ curl http://localhost:3000/health
 {
   "status": "ok",
   "keys": 3,
-  "pool": "[0]:ready  [1]:cooling(42s)  [2]:ready"
+  "details": [
+    {
+      "index": 0,
+      "key": "nvapi-xxxxxxxxxxxx",
+      "status": "ready",
+      "request_count": 15,
+      "last_used": "2023-11-15T14:30:00Z",
+      "cooldown_until": "2023-11-15T14:29:00Z"
+    },
+    {
+      "index": 1,
+      "key": "nvapi-yyyyyyyyyyyy",
+      "status": "cooling(42s)",
+      "request_count": 40,
+      "last_used": "2023-11-15T14:31:00Z",
+      "cooldown_until": "2023-11-15T14:32:00Z"
+    }
+  ]
 }
 ```
 
@@ -293,7 +310,7 @@ Keys live in `.env` on your machine and are only ever sent to the upstream provi
 Alvus waits for the soonest key to become available and retries, up to 10 times. If everything stays exhausted, it returns `503`. In practice, with 3 keys and a 60s window this is very hard to trigger.
 
 **Can I reload keys without restarting?**
-Not yet — planned for a future release. For now, restart the binary after editing `.env`. With systemd: `sudo systemctl restart alvus`.
+Yes! Alvus now supports hot-reloading when the `.env` file changes. Simply edit your `.env` file and Alvus will automatically detect the changes and reload the configuration within 1 second. No restart needed.
 
 **Does it work on a Raspberry Pi Zero / 32-bit hardware?**
 Yes. Prebuilt binaries include `linux/arm` and `linux/386`. The binary is fully static — no runtime needed.
@@ -306,7 +323,7 @@ Around 2 MB at idle. It's a single static Go binary with no runtime overhead —
 ## Roadmap
 
 - [x] Hot-reload when .env changes (no restart needed)
-- [x] Per-key request counters in `/health`
+- [x] Per-key request counters and detailed status in `/health`
 - [ ] Web dashboard (opt-in, zero-dep binary stays the same)
 
 ---
