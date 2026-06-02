@@ -1,7 +1,5 @@
 package main
 
-
-
 import (
 	"bytes"
 	"context"
@@ -20,14 +18,21 @@ import (
 	"time"
 )
 
+func maskKey(key string) string {
+	if len(key) <= 12 {
+		return "****"
+	}
+	return key[:8] + "..." + key[len(key)-4:]
+}
+
 type LogEntry struct {
-	Timestamp       string `json:"timestamp"`
-	Key             string `json:"key"`
-	KeyIndex        int    `json:"key_index"`
-	Method          string `json:"method"`
-	URL             string `json:"url"`
-	Status          int    `json:"status"`
-	RequestBodySize int    `json:"request_body_size"`
+	Timestamp string `json:"timestamp"`
+	Key string `json:"key"`
+	KeyIndex int `json:"key_index"`
+	Method string `json:"method"`
+	URL string `json:"url"`
+	Status int `json:"status"`
+	RequestBodySize int `json:"request_body_size"`
 }
 
 var (
@@ -173,12 +178,12 @@ func (p *KeyPool) GetKeyDetails() []map[string]interface{} {
 	for i := range p.keys {
 		p.cleanupOldRequests(i)
 		keyDetail := map[string]interface{}{
-			"index":               i,
-			"key":                 p.keys[i],
-			"disabled":            p.disabled[i],
+			"index": i,
+			"key": maskKey(p.keys[i]),
+			"disabled": p.disabled[i],
 			"requests_per_minute": p.requestsInLastMinute(i),
-			"last_used":           p.lastUsed[i].Format(time.RFC3339),
-			"cooldown_until":      p.cooldowns[i].Format(time.RFC3339),
+			"last_used": p.lastUsed[i].Format(time.RFC3339),
+			"cooldown_until": p.cooldowns[i].Format(time.RFC3339),
 		}
 		keyDetail["status"] = p.keyStatusLabel(i, now)
 		details[i] = keyDetail
@@ -294,10 +299,14 @@ func (s *ServerState) configHandler(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodGet {
 		w.Header().Set("Content-Type", "application/json")
+		maskedKeys := make([]string, len(keys))
+		for i, k := range keys {
+			maskedKeys[i] = maskKey(k)
+		}
 		json.NewEncoder(w).Encode(ConfigPayload{
 			TargetBase: cfg.TargetBase,
-			GenaiBase:  cfg.GenaiBase,
-			Keys:       keys,
+			GenaiBase: cfg.GenaiBase,
+			Keys: maskedKeys,
 		})
 		return
 	}
@@ -309,6 +318,26 @@ func (s *ServerState) configHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		payload.TargetBase = strings.TrimSpace(payload.TargetBase)
+		payload.GenaiBase = strings.TrimSpace(payload.GenaiBase)
+		for i := range payload.Keys {
+			payload.Keys[i] = strings.TrimSpace(payload.Keys[i])
+		}
+		payload.Keys = filterEmpty(payload.Keys)
+
+		if payload.TargetBase == "" {
+			http.Error(w, "targetBase is required", http.StatusBadRequest)
+			return
+		}
+		if payload.GenaiBase == "" {
+			http.Error(w, "genaiBase is required", http.StatusBadRequest)
+			return
+		}
+		if len(payload.Keys) == 0 {
+			http.Error(w, "at least one API key is required", http.StatusBadRequest)
+			return
+		}
+
 		envLines := []string{
 			fmt.Sprintf("TARGET_BASE_URL=%s", payload.TargetBase),
 			fmt.Sprintf("GENAI_BASE_URL=%s", payload.GenaiBase),
@@ -317,18 +346,43 @@ func (s *ServerState) configHandler(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("COOLDOWN_SEC=%d", cfg.CooldownSec),
 		}
 
-		if err := os.WriteFile(".env", []byte(strings.Join(envLines, "\n")), 0644); err != nil {
+		if err := os.WriteFile(".env", []byte(strings.Join(envLines, "\n")), 0600); err != nil {
 			log.Printf("❌ Failed to write .env: %v", err)
 			http.Error(w, "failed to save config", http.StatusInternalServerError)
 			return
 		}
 
 		log.Printf("📝 Configuration updated via API")
-		w.WriteHeader(http.StatusAccepted)
+
+		newCfg, newPool, err := reloadConfig()
+		if err != nil {
+			log.Printf("⚠️ Immediate reload failed: %v", err)
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+
+		s.mu.Lock()
+		s.cfg = newCfg
+		s.pool = newPool
+		s.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "reloaded"})
 		return
 	}
 
 	w.WriteHeader(http.StatusMethodNotAllowed)
+}
+
+func filterEmpty(ss []string) []string {
+	filtered := make([]string, 0, len(ss))
+	for _, s := range ss {
+		if s != "" {
+			filtered = append(filtered, s)
+		}
+	}
+	return filtered
 }
 
 func (s *ServerState) healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -516,7 +570,19 @@ func (s *ServerState) proxyHandler(w http.ResponseWriter, r *http.Request) {
 func (s *ServerState) logsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	usageMu.Lock()
-	data, _ := json.Marshal(usageLogs)
+	masked := make([]LogEntry, len(usageLogs))
+	for i, entry := range usageLogs {
+		masked[i] = LogEntry{
+			Timestamp: entry.Timestamp,
+			Key: maskKey(entry.Key),
+			KeyIndex: entry.KeyIndex,
+			Method: entry.Method,
+			URL: entry.URL,
+			Status: entry.Status,
+			RequestBodySize: entry.RequestBodySize,
+		}
+	}
+	data, _ := json.Marshal(masked)
 	usageMu.Unlock()
 	w.Write(data)
 }
@@ -1061,8 +1127,8 @@ const dashboardHTML = `<!DOCTYPE html>
         });
 
         // Polling
-        setInterval(updateStatus, 2000);
-        setInterval(updateLogs, 3000);
+        setInterval(updateStatus, 5000);
+        setInterval(updateLogs, 5000);
         updateStatus();
         updateLogs();
 
@@ -1072,14 +1138,16 @@ const dashboardHTML = `<!DOCTYPE html>
 `
 
 func (s *ServerState) clearHandler(w http.ResponseWriter, r *http.Request) {
-    if r.Method != http.MethodPost {
-        w.WriteHeader(http.StatusMethodNotAllowed)
-        return
-    }
-    usageMu.Lock()
-    usageLogs = []LogEntry{}
-    usageMu.Unlock()
-    w.WriteHeader(http.StatusNoContent)
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	usageMu.Lock()
+	usageLogs = []LogEntry{}
+	usageMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "cleared"})
 }
 
 // ── .env Watcher ──────────────────────────────
