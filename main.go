@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -320,8 +321,28 @@ func (s *ServerState) configHandler(w http.ResponseWriter, r *http.Request) {
 
 		payload.TargetBase = strings.TrimSpace(payload.TargetBase)
 		payload.GenaiBase = strings.TrimSpace(payload.GenaiBase)
+
+		s.mu.RLock()
+		currentKeys := s.pool.keys
+		s.mu.RUnlock()
+
+		reclaimed := make(map[int]bool)
 		for i := range payload.Keys {
-			payload.Keys[i] = strings.TrimSpace(payload.Keys[i])
+			k := strings.TrimSpace(payload.Keys[i])
+			if k == "" {
+				continue
+			}
+			// If the key is masked (contains "..." or is "****"), try to restore it from the current pool
+			if strings.Contains(k, "...") || k == "****" {
+				for j, ck := range currentKeys {
+					if !reclaimed[j] && maskKey(ck) == k {
+						k = ck
+						reclaimed[j] = true
+						break
+					}
+				}
+			}
+			payload.Keys[i] = k
 		}
 		payload.Keys = filterEmpty(payload.Keys)
 
@@ -1197,6 +1218,17 @@ func watchEnvFile(state *ServerState, stop <-chan struct{}) {
 // ── Main ──────────────────────────────────────
 
 func main() {
+	isLocal := flag.Bool("local", false, "Bind to 127.0.0.1 (local access only)")
+	isNetwork := flag.Bool("network-only", false, "Bind to 0.0.0.0 (accessible via LAN)")
+	flag.Parse()
+
+	host := "" // Default (binds to all interfaces)
+	if *isLocal {
+		host = "127.0.0.1"
+	} else if *isNetwork {
+		host = "0.0.0.0"
+	}
+
 	loadDotEnv(".env")
 	cfg, pool := loadConfig()
 	state := newServerState(cfg, pool)
@@ -1208,7 +1240,7 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	server := &http.Server{Addr: ":" + cfg.Port, Handler: state.mux}
+	server := &http.Server{Addr: host + ":" + cfg.Port, Handler: state.mux}
 
 	go func() {
 		<-sigCh
@@ -1221,7 +1253,11 @@ func main() {
 		}
 	}()
 
-	log.Printf("⚡ Alvus :%s → %s | genai → %s (%d keys)", cfg.Port, cfg.TargetBase, cfg.GenaiBase, len(pool.keys))
+	displayHost := host
+	if displayHost == "" {
+		displayHost = "0.0.0.0"
+	}
+	log.Printf("⚡ Alvus %s:%s → %s | genai → %s (%d keys)", displayHost, cfg.Port, cfg.TargetBase, cfg.GenaiBase, len(pool.keys))
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("❌ Server error: %v", err)
 	}
